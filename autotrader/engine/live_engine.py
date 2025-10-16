@@ -1,120 +1,59 @@
-from __future__ import annotations
-
-import logging
-import signal
-import sys
+import math
 import time
-from datetime import datetime, timedelta, timezone
 from typing import List
 
-from autotrader.broker import AlpacaBroker, parse_timeframe
-from autotrader.strategy import RSIStrategy, RSIStrategyConfig
-
-
-logger = logging.getLogger("autotrader.engine")
-
-
-def _utc_now() -> datetime:
-    return datetime.now(tz=timezone.utc)
-
-
-def _sleep_until_next_minute(pad_seconds: float = 1.0) -> None:
-    now = _utc_now()
-    next_minute = (now.replace(second=0, microsecond=0) + timedelta(minutes=1))
-    to_sleep = (next_minute - now).total_seconds() + pad_seconds
-    if to_sleep > 0:
-        time.sleep(to_sleep)
+from autotrader.broker.alpaca import AlpacaBroker, Order
+from autotrader.indicators.rsi import compute_rsi
+from autotrader.strategy.rsi_strategy import rsi_signal
 
 
 class LiveEngine:
-    def __init__(
-        self,
-        broker: AlpacaBroker,
-        symbols: List[str],
-        timeframe: str = "1Min",
-        rsi_period: int = 14,
-        rsi_buy_threshold: float = 30.0,
-        rsi_sell_threshold: float = 70.0,
-        order_qty: int = 1,
-        long_only: bool = True,
-    ) -> None:
+    def __init__(self, broker: AlpacaBroker, symbol: str, timeframe: str, rsi_period: int,
+                 buy_threshold: float, sell_threshold: float, position_size_usd: float, poll_seconds: int):
         self.broker = broker
-        self.symbols = symbols
-        self.tf_str = timeframe
-        self.tf = parse_timeframe(timeframe)
-        self.order_qty = order_qty
-        self.long_only = long_only
-        self.strategy = RSIStrategy(
-            RSIStrategyConfig(
-                period=rsi_period,
-                buy_threshold=rsi_buy_threshold,
-                sell_threshold=rsi_sell_threshold,
-                long_only=long_only,
-            )
-        )
-        self._stop = False
+        self.symbol = symbol
+        self.timeframe = timeframe
+        self.rsi_period = rsi_period
+        self.buy_threshold = buy_threshold
+        self.sell_threshold = sell_threshold
+        self.position_size_usd = position_size_usd
+        self.poll_seconds = poll_seconds
 
-    def _handle_sigint(self, *_args) -> None:
-        logger.info("Received signal, stopping...")
-        self._stop = True
-
-    def run(self) -> None:
-        logging.basicConfig(
-            level=logging.INFO,
-            format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        )
-        signal.signal(signal.SIGINT, self._handle_sigint)
-        signal.signal(signal.SIGTERM, self._handle_sigint)
-
-        logger.info("Starting live engine for symbols=%s timeframe=%s qty=%s", self.symbols, self.tf_str, self.order_qty)
-
-        # Pre-compute how many bars are needed
-        min_bars = max(100, self.strategy.config.period + 5)
-
-        while not self._stop:
+    def run_forever(self) -> None:
+        print(f"Starting live engine for {self.symbol} @ {self.timeframe}")
+        while True:
             try:
-                if not self.broker.is_market_open():
-                    logger.info("Market is closed. Sleeping until next minute...")
-                    _sleep_until_next_minute(pad_seconds=1.0)
+                bars = self.broker.get_latest_bars(self.symbol, self.timeframe, limit=max(200, self.rsi_period + 10))
+                closes: List[float] = [float(b["c"]) for b in bars]
+                rsis = compute_rsi(closes, self.rsi_period)
+                signal = rsi_signal(rsis, self.buy_threshold, self.sell_threshold)
+
+                last_price = closes[-1] if closes else None
+                positions = self.broker.get_positions(self.symbol)
+                qty_held = float(positions[0]["qty"] if positions else 0)
+
+                print({
+                    "price": last_price,
+                    "rsi": rsis[-1] if rsis else None,
+                    "signal": signal.__dict__,
+                    "qty_held": qty_held,
+                })
+
+                if last_price is None:
+                    time.sleep(self.poll_seconds)
                     continue
 
-                for symbol in self.symbols:
-                    closes = self.broker.get_recent_closes(symbol, self.tf, limit=min_bars)
-                    if len(closes) < self.strategy.config.period + 2:
-                        logger.debug("%s: not enough bars (%d)", symbol, len(closes))
-                        continue
-
-                    signal_decision = self.strategy.decide(closes)
-                    pos_qty = self.broker.get_position_qty(symbol)
-
-                    if signal_decision == "buy":
-                        if self.long_only and pos_qty > 0:
-                            logger.info("%s: already long (%d), skip buy", symbol, pos_qty)
-                        else:
-                            logger.info("%s: BUY %d (RSI cross above %.1f)", symbol, self.order_qty, self.strategy.config.buy_threshold)
-                            try:
-                                self.broker.cancel_open_orders(symbol)
-                                self.broker.submit_market_order(symbol, self.order_qty, "buy")
-                            except Exception as e:
-                                logger.exception("%s: buy order failed: %s", symbol, e)
-
-                    elif signal_decision == "sell":
-                        if pos_qty > 0:
-                            logger.info("%s: SELL to exit (%d) (RSI cross below %.1f)", symbol, pos_qty, self.strategy.config.sell_threshold)
-                            try:
-                                self.broker.cancel_open_orders(symbol)
-                                self.broker.submit_market_order(symbol, pos_qty, "sell")
-                            except Exception as e:
-                                logger.exception("%s: sell order failed: %s", symbol, e)
-                        else:
-                            logger.info("%s: no long position to exit", symbol)
-                    else:
-                        logger.debug("%s: no action", symbol)
-
-                _sleep_until_next_minute(pad_seconds=1.0)
+                if signal.action == "buy" and qty_held == 0:
+                    qty = max(1, math.floor(self.position_size_usd / last_price))
+                    order = Order(symbol=self.symbol, qty=str(qty), side="buy", type="market", time_in_force="day")
+                    resp = self.broker.submit_order(order)
+                    print({"placed_buy": resp})
+                elif signal.action == "sell" and qty_held > 0:
+                    order = Order(symbol=self.symbol, qty=str(int(qty_held)), side="sell", type="market", time_in_force="day")
+                    resp = self.broker.submit_order(order)
+                    print({"placed_sell": resp})
 
             except Exception as e:
-                logger.exception("Engine loop error: %s", e)
-                time.sleep(3)
+                print({"error": str(e)})
 
-        logger.info("Engine stopped.")
+            time.sleep(self.poll_seconds)

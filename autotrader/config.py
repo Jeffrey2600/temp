@@ -1,71 +1,50 @@
-from __future__ import annotations
-
 import os
 from dataclasses import dataclass
-from typing import List
-
-try:
-    from dotenv import load_dotenv  # type: ignore
-    load_dotenv()
-except Exception:
-    # dotenv is optional; continue if not installed
-    pass
+from dotenv import load_dotenv
 
 
-@dataclass
-class Config:
+load_dotenv()
+
+
+@dataclass(frozen=True)
+class Settings:
     alpaca_api_key: str
-    alpaca_secret_key: str
-    paper: bool
-    base_url: str
-
-    symbols: List[str]
-    timeframe: str  # e.g., "1Min"
-
-    rsi_period: int
-    rsi_buy_threshold: float
-    rsi_sell_threshold: float
-
-    order_qty: int
-    poll_interval_sec: int
-    long_only: bool = True
+    alpaca_api_secret: str
+    alpaca_base_url: str  # e.g. https://paper-api.alpaca.markets or https://api.alpaca.markets
+    alpaca_data_base_url: str  # e.g. https://data.alpaca.markets
+    symbol: str           # e.g. AAPL
+    time_frame: str       # e.g. 1Min, 5Min, 15Min
+    rsi_period: int       # e.g. 14
+    rsi_buy_threshold: float  # e.g. 30.0
+    rsi_sell_threshold: float # e.g. 70.0
+    position_size_usd: float  # e.g. 100.0 per trade
+    poll_seconds: int     # e.g. 60 for 1-minute bars
 
 
-def _bool_env(name: str, default: bool) -> bool:
-    val = os.getenv(name)
-    if val is None:
-        return default
-    return val.strip().lower() in {"1", "true", "yes", "y"}
+def load_settings() -> Settings:
+    missing = []
+    def env(name: str, default: str | None = None) -> str:
+        val = os.getenv(name, default)
+        if val is None:
+            missing.append(name)
+        return val  # type: ignore
 
-
-def _get_base_url(paper: bool) -> str:
-    return "https://paper-api.alpaca.markets" if paper else "https://api.alpaca.markets"
-
-
-def _parse_symbols(value: str | None) -> List[str]:
-    if not value:
-        return ["AAPL"]
-    symbols = [s.strip().upper() for s in value.split(",") if s.strip()]
-    return symbols or ["AAPL"]
-
-
-def load_config() -> Config:
-    paper = _bool_env("ALPACA_PAPER", True)
-    cfg = Config(
-        alpaca_api_key=os.getenv("ALPACA_API_KEY", ""),
-        alpaca_secret_key=os.getenv("ALPACA_SECRET_KEY", ""),
-        paper=paper,
-        base_url=_get_base_url(paper),
-        symbols=_parse_symbols(os.getenv("SYMBOLS")),
-        timeframe=os.getenv("TIMEFRAME", "1Min"),
-        rsi_period=int(os.getenv("RSI_PERIOD", "14")),
-        rsi_buy_threshold=float(os.getenv("RSI_BUY_THRESHOLD", "30")),
-        rsi_sell_threshold=float(os.getenv("RSI_SELL_THRESHOLD", "70")),
-        order_qty=int(os.getenv("ORDER_QTY", "1")),
-        poll_interval_sec=int(os.getenv("POLL_INTERVAL_SEC", "5")),
+    settings = Settings(
+        alpaca_api_key=env("ALPACA_API_KEY", ""),
+        alpaca_api_secret=env("ALPACA_API_SECRET", ""),
+        alpaca_base_url=env("ALPACA_BASE_URL", "https://paper-api.alpaca.markets"),
+        alpaca_data_base_url=env("ALPACA_DATA_BASE_URL", "https://data.alpaca.markets"),
+        symbol=env("SYMBOL", "AAPL"),
+        time_frame=env("TIME_FRAME", "1Min"),
+        rsi_period=int(env("RSI_PERIOD", "14")),
+        rsi_buy_threshold=float(env("RSI_BUY_THRESHOLD", "30")),
+        rsi_sell_threshold=float(env("RSI_SELL_THRESHOLD", "70")),
+        position_size_usd=float(env("POSITION_SIZE_USD", "100")),
+        poll_seconds=int(env("POLL_SECONDS", "60")),
     )
-    if not cfg.alpaca_api_key or not cfg.alpaca_secret_key:
-        raise RuntimeError(
-            "Missing ALPACA_API_KEY or ALPACA_SECRET_KEY in environment."
-        )
-    return cfg
+
+    if missing:
+        # We allow defaults for most, but warn if keys are empty
+        if not settings.alpaca_api_key or not settings.alpaca_api_secret:
+            print("Warning: ALPACA_API_KEY/ALPACA_API_SECRET not set. Set them to trade.")
+    return settings
